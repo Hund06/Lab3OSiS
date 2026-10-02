@@ -10,4 +10,4 @@ src/sequential_min_max
 ~$*.docx
 
 # Мне захотелось скрыть отчетик)()()()()
-.docx
+*.docx
