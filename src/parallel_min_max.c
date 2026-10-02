@@ -5,23 +5,24 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-
 #include <sys/time.h>
 #include <sys/types.h>
 #include <sys/wait.h>
-
 #include <getopt.h>
 
 #include "find_min_max.h"
 #include "utils.h"
 
-// Основная программа для параллельного поиска минимума и максимума
+// Основная программа для параллельного поиска минимума и максимума в массиве.
+// Распределяет вычисления между несколькими дочерними процессами с использованием fork().
+// Для межпроцессного взаимодействия применяет неименованные каналы (pipe) или файлы.
 int main(int argc, char **argv) {
   int seed = -1;
   int array_size = -1;
   int pnum = -1;
   bool with_files = false;
 
+  // Парсинг аргументов командной строки с помощью getopt_long
   while (true) {
     int current_optind = optind ? optind : 1;
 
@@ -63,7 +64,6 @@ int main(int argc, char **argv) {
           case 3:
             with_files = true;
             break;
-
           default:
             printf("Index %d is out of options\n", option_index);
         }
@@ -71,10 +71,8 @@ int main(int argc, char **argv) {
       case 'f':
         with_files = true;
         break;
-
       case '?':
         break;
-
       default:
         printf("getopt returned character code 0%o?\n", c);
     }
@@ -86,19 +84,21 @@ int main(int argc, char **argv) {
   }
 
   if (seed == -1 || array_size == -1 || pnum == -1) {
-    printf("Usage: %s --seed \"num\" --array_size \"num\" --pnum \"num\" \n",
-           argv[0]);
+    printf("Usage: %s --seed \"num\" --array_size \"num\" --pnum \"num\" \n", argv[0]);
     return 1;
   }
 
+  // Выделение памяти под массив и его заполнение псевдослучайными числами
   int *array = malloc(sizeof(int) * array_size);
   GenerateArray(array, array_size, seed);
   int active_child_processes = 0;
 
+  // Фиксируем время начала вычислений для замера производительности
   struct timeval start_time;
   gettimeofday(&start_time, NULL);
 
-  // Создаем pipe для общения между процессами, если не используем файлы
+  // Создаем неименованный канал (pipe) для передачи данных из оперативной памяти.
+  // pipefd[0] используется для чтения, pipefd[1] - для записи.
   int pipefd[2];
   if (!with_files) {
     if (pipe(pipefd) == -1) {
@@ -107,29 +107,38 @@ int main(int argc, char **argv) {
     }
   }
 
+  // Цикл создания дочерних процессов
   for (int i = 0; i < pnum; i++) {
     pid_t child_pid = fork();
     if (child_pid >= 0) {
       active_child_processes += 1;
+      
+      // Блок кода, который выполняется ТОЛЬКО внутри дочернего процесса
       if (child_pid == 0) {
         
-        // Разбиваем массив на равные части для каждого процесса
+        // Вычисляем границы участка массива для текущего процесса.
+        // Последний процесс забирает весь остаток массива, если размер не делится нацело.
         unsigned int step = array_size / pnum;
         unsigned int begin = i * step;
         unsigned int end = (i == pnum - 1) ? array_size : (i + 1) * step;
 
+        // Ищем локальные минимум и максимум на выделенном участке
         struct MinMax current_min_max = GetMinMax(array, begin, end);
 
+        // Передача результатов родительскому процессу
         if (with_files) {
+          // Создаем уникальный бинарный файл для каждого процесса
           char filename[256];
           sprintf(filename, "temp_result_%d.bin", i);
           FILE *f = fopen(filename, "wb");
           fwrite(&current_min_max, sizeof(struct MinMax), 1, f);
           fclose(f);
         } else {
-          // Записываем структуру с результатом в конец трубы, предназначенный для записи
+          // Записываем структуру целиком в канал (pipe). 
+          // Родитель сможет прочитать эти байты с другой стороны трубы.
           write(pipefd[1], &current_min_max, sizeof(struct MinMax));
         }
+        // Дочерний процесс должен завершить работу после отправки данных
         return 0;
       }
     } else {
@@ -138,40 +147,47 @@ int main(int argc, char **argv) {
     }
   }
 
-  // Родительский процесс ждет завершения всех дочерних процессов
+  // Блок кода родительского процесса: ожидание завершения всех рабочих процессов.
+  // wait(NULL) блокирует выполнение родителя, пока любой из детей не завершится.
   while (active_child_processes > 0) {
     wait(NULL);
     active_child_processes -= 1;
   }
 
+  // Подготовка структуры для поиска глобального минимума и максимума
   struct MinMax min_max;
   min_max.min = INT_MAX;
   min_max.max = INT_MIN;
 
+  // Сбор результатов от всех дочерних процессов
   for (int i = 0; i < pnum; i++) {
     struct MinMax current_min_max;
 
     if (with_files) {
+      // Чтение структур из временных файлов на жестком диске
       char filename[256];
       sprintf(filename, "temp_result_%d.bin", i);
       FILE *f = fopen(filename, "rb");
       fread(&current_min_max, sizeof(struct MinMax), 1, f);
       fclose(f);
-      remove(filename); // Удаляем временный файл после прочтения
+      remove(filename); // Удаляем временный файл, чтобы не засорять систему
     } else {
-      // Считываем результат работы одного из дочерних процессов из трубы
+      // Чтение данных напрямую из буфера трубы в оперативной памяти
       read(pipefd[0], &current_min_max, sizeof(struct MinMax));
     }
 
+    // Сравниваем локальные результаты с глобальными
     if (current_min_max.min < min_max.min) min_max.min = current_min_max.min;
     if (current_min_max.max > min_max.max) min_max.max = current_min_max.max;
   }
 
+  // Обязательно закрываем дескрипторы канала, чтобы освободить системные ресурсы
   if (!with_files) {
       close(pipefd[0]);
       close(pipefd[1]);
   }
 
+  // Фиксируем время окончания вычислений и высчитываем разницу в миллисекундах
   struct timeval finish_time;
   gettimeofday(&finish_time, NULL);
 
